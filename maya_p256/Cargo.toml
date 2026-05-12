@@ -1,0 +1,39 @@
+[package]
+name = "maya_p256"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "maya_p256"
+
+[dependencies]
+rayon = { version = "1", optional = true }
+ark-ec = { version = "0.5", features = [] }
+ark-ff = { version = "0.5", features = [] }
+ark-std = { version = "0.5", features = [] }
+ark-serialize = { version = "0.5" }
+ark-secp256r1 = { version = "0.5" }
+merlin = "3"
+rand = "0.8"
+byteorder = "1"
+sha3 = "0.10"
+digest = "0.10"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+bincode = "1"
+rand_chacha = "0.3"
+
+[features]
+parallel = ["ark-ec/parallel", "ark-ff/parallel", "ark-std/parallel", "dep:rayon"]
+asm = ["ark-ff/asm"]
+yoloproofs = []
+production = []
+
+[[bench]]
+name = "r1cs"
+harness = false
+required-features = ["yoloproofs"]

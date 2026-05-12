@@ -1,0 +1,56 @@
+[package]
+name = "maya_ristretto"
+version = "1.0.1"
+edition = "2015"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+categories = ["cryptography"]
+keywords = ["cryptography", "ristretto", "zero-knowledge"]
+autobenches = false
+
+[dependencies]
+curve25519-dalek = { version = "4", features = ["serde", "rand_core"] }
+subtle = "2"
+sha3 = "0.10"
+digest = "0.10"
+rand = "0.8"
+byteorder = "1"
+serde = "1"
+serde_derive = "1"
+failure = "0.1"
+merlin = "3"
+zeroize = "1"
+clap = "2.33"
+rayon = { version = "1.10", optional = true }
+
+[dev-dependencies]
+hex = "0.4"
+criterion = "0.4"
+bincode = "1"
+rand_chacha = "0.3"
+
+[features]
+parallel = ["rayon"]
+yoloproofs = []
+production = []
+global_padding = []
+
+[[bench]]
+name = "r1cs"
+harness = false
+required-features = ["yoloproofs"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"          
+codegen-units = 1     
+panic = "abort"      
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+
+
+
