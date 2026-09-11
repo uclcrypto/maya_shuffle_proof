@@ -3,11 +3,9 @@
 This repository contains a Rust implementation of the MAYA shuffle argument with
 O(log n) communication complexity. Two curve instantiations are provided: one based on
 curve25519-dalek (Ristretto255) and one based on the arkworks library (NIST P-256).
-This artifact accompanies the paper of the same name.
+This repository accompanies the MAYA paper accepted at CCS ’26.
 
-
-For a verifier-oriented specification,  please see the
-[`maya_ristretto/docs/Verifier_Specification.pdf`](maya_ristretto/docs/Verifier_Specification.pdf).
+More information about MAYA, including a verifier-oriented specification, is available on the https://thaodoanvan.github.io/maya_website/.
 
 
 ## Requirements
