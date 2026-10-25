@@ -1,9 +1,8 @@
 // MAYA-Ristretto Benchmark - Ristretto255
 
 extern crate maya_ristretto;
-use maya_ristretto::r1cs::LinearCombination;
-use maya_ristretto::r1cs::{ConstraintSystem, Prover, R1CSError, R1CSProof, Variable, Verifier};
-use maya_ristretto::transcript::TranscriptProtocol;
+use maya_ristretto::r1cs::R1CSProof;
+use maya_ristretto::shuffle::{derive_challenge_e, KShuffleGadget};
 use maya_ristretto::{BulletproofGens, PedersenGens};
 
 #[macro_use]
@@ -20,10 +19,6 @@ use merlin::Transcript;
 
 extern crate rand;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
-
-extern crate rand_chacha;
-use rand_chacha::ChaCha20Rng;
 
 extern crate bincode;
 
@@ -36,13 +31,6 @@ extern crate rayon;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-
-#[allow(dead_code)]
-const N: usize = 1000;
-#[allow(dead_code)]
-const K: usize = 2;
-#[allow(dead_code)]
-const D: usize = 20;
 
 /// Number of benchmark samples 
 const SAMPLES: usize = 10;
@@ -60,188 +48,6 @@ const fn pow_usize(base: usize, exp: usize) -> usize {
     result
 }
 
-#[allow(dead_code)]
-const fn compute_m(n: usize, k_pow_d: usize) -> usize {
-    (n + k_pow_d - 1) / k_pow_d
-}
-
-#[allow(dead_code)]
-const K_POW_D: usize = pow_usize(K, D);
-#[allow(dead_code)]
-const M: usize = compute_m(N, K_POW_D);
-#[allow(dead_code)]
-const N_PADDED: usize = M * K_POW_D;
-#[allow(dead_code)]
-const PADDING: usize = N_PADDED - N;
-
-// --- Shuffle Gadget ---
-struct KShuffleGadget;
-
-impl KShuffleGadget {
-    fn fill_cs<CS: ConstraintSystem>(cs: &mut CS, x: &[Variable], y: &[Scalar], k_original: usize) {
-        let z = cs.challenge_scalar(b"k-scalar shuffle challenge");
-        let k = x.len();
-        assert_eq!(x.len(), y.len());
-
-        let mut prod_y = Scalar::ONE;
-        for yi in y {
-            prod_y *= *yi - z;
-        }
-
-        let mut prev_lc = if k_original == 0 {
-            cs.constrain(x[0] - Scalar::ZERO);
-            LinearCombination::from(-z)
-        } else {
-            x[0] - z
-        };
-
-        for i in 1..k {
-            if i >= k_original {
-                cs.constrain(x[i] - Scalar::ZERO);
-                prev_lc = prev_lc * (-z);
-            } else {
-                let term = x[i] - z;
-                let (_, _, out_var) = cs.multiply(prev_lc, term);
-                prev_lc = LinearCombination::from(out_var);
-            }
-        }
-        cs.constrain(prev_lc - prod_y);
-    }
-
-    pub fn prove<'a, 'b>(
-        pc_gens: &'b PedersenGens,
-        bp_gens: &'b BulletproofGens,
-        transcript: &'a mut Transcript,
-        input: &[Scalar],
-        output: &[Scalar],
-        c1_prime: &[RistrettoPoint],
-        c2_prime: &[RistrettoPoint],
-        r_prime: Scalar,
-        k_fold: usize,
-        num_rounds: usize,
-        rng: &mut (impl rand::RngCore + rand::CryptoRng),
-    ) -> Result<(R1CSProof, CompressedRistretto), R1CSError> {
-        let k = input.len();
-        let k_original = c1_prime.len();
-        if k <= 1 {
-            return Err(R1CSError::InputLengthError);
-        }
-
-        transcript.append_message(b"dom-sep", b"ShuffleProof");
-        transcript.append_message(b"k", Scalar::from(k as u64).as_bytes());
-
-        let mut prover = Prover::new(bp_gens, pc_gens, transcript);
-        let v_blinding = Scalar::random(rng);
-        let (output_commitment, output_vars) = prover.commit_vec(output, v_blinding, k_original);
-        let mut cs = prover.finalize_inputs();
-        Self::fill_cs(&mut cs, &output_vars, input, k_original);
-        let proof = cs.prove(c1_prime, c2_prime, r_prime, k_fold, num_rounds)?;
-        Ok((proof, output_commitment))
-    }
-
-    pub fn verify<'a, 'b>(
-        pc_gens: &'b PedersenGens,
-        bp_gens: &'b BulletproofGens,
-        transcript: &'a mut Transcript,
-        proof: &R1CSProof,
-        input: &[Scalar],
-        output_commitment: CompressedRistretto,
-        c1_prime: &[RistrettoPoint],
-        c2_prime: &[RistrettoPoint],
-        c_combined: &[RistrettoPoint],
-    ) -> Result<(), R1CSError> {
-        let k = input.len();
-        transcript.append_message(b"dom-sep", b"ShuffleProof");
-        transcript.append_message(b"k", Scalar::from(k as u64).as_bytes());
-
-        let mut verifier = Verifier::new(bp_gens, pc_gens, transcript);
-        let output_vars = verifier.commit_vec(output_commitment, k);
-        let mut cs = verifier.finalize_inputs();
-        let k_original = c1_prime.len();
-        Self::fill_cs(&mut cs, &output_vars, input, k_original);
-        cs.verify(proof, c1_prime, c2_prime, c_combined)
-    }
-}
-
-// Derive the challenge vector e deterministically from public parameters via
-// Fiat-Shamir: e = PRG(Hash(pk, ck, C, C'))
-fn derive_challenge_e(
-    pc_gens: &PedersenGens,
-    bp_gens: &BulletproofGens,
-    c1_bytes: &[u8],
-    c2_bytes: &[u8],
-    c1p_bytes: &[u8],
-    c2p_bytes: &[u8],
-    n_original: usize,
-    n_padded: usize,
-) -> Vec<Scalar> {
-    let verbose = std::env::var("VERBOSE").ok()
-        .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .is_some();
-    let mut ts = Transcript::new(b"FiatShamir-e");
-    ts.append_message(b"dom-sep", b"challenge-e-derivation");
-
-    ts.commit_point(b"pk_g", &pc_gens.B.compress());
-    ts.commit_point(b"pk_f", &pc_gens.F.compress());
-    ts.commit_point(b"ck_h", &pc_gens.B_blinding.compress());
-
-    <Transcript as TranscriptProtocol>::commit_u64(&mut ts, b"ck_n", bp_gens.gens_capacity as u64);
-    if let Some(g0) = bp_gens.G_vec.get(0).and_then(|v| v.get(0)) {
-        ts.commit_point(b"ck_g0", &g0.compress());
-    }
-    if let Some(h0) = bp_gens.H_vec.get(0).and_then(|v| v.get(0)) {
-        ts.commit_point(b"ck_h0", &h0.compress());
-    }
-
-    let t_transcript = Instant::now();
-    for chunk in c1_bytes.chunks(32) {
-        ts.append_message(b"c1", chunk);
-    }
-    for chunk in c2_bytes.chunks(32) {
-        ts.append_message(b"c2", chunk);
-    }
-    for chunk in c1p_bytes.chunks(32) {
-        ts.append_message(b"c1p", chunk);
-    }
-    for chunk in c2p_bytes.chunks(32) {
-        ts.append_message(b"c2p", chunk);
-    }
-    if verbose {
-        eprintln!(
-            "[derive_e] n={}: transcript feed 4N bytes: {:?}",
-            n_original,
-            t_transcript.elapsed()
-        );
-    }
-
-    let t_expand = Instant::now();
-    let mut seed = [0u8; 32];
-    ts.challenge_bytes(b"e_seed", &mut seed);
-    let mut prg = ChaCha20Rng::from_seed(seed);
-    let mut e: Vec<Scalar> = (0..n_original).map(|_| Scalar::random(&mut prg)).collect();
-    e.resize(n_padded, Scalar::ZERO);
-    if verbose {
-        eprintln!(
-            "[derive_e] n={}: seed-squeeze + scalar expand: {:?}",
-            n_original,
-            t_expand.elapsed()
-        );
-    }
-
-    e
-}
-
-// Benchmark-only deterministic RNG.
-// Replace with OsRng or another OS-seeded CSPRNG outside tests/benchmarks.
-#[cfg(all(feature = "parallel", not(feature = "production")))]
-fn deterministic_rand_scalar(index: usize) -> Scalar {
-    use rand::SeedableRng;
-    let mut seed = [0u8; 32];
-    seed[..8].copy_from_slice(&(index as u64).to_le_bytes());
-    seed[8..16].copy_from_slice(&0xCAFEu64.to_le_bytes()); 
-    let mut rng = rand::rngs::StdRng::from_seed(seed);
-    Scalar::random(&mut rng)
-}
 
 // --- File I/O Helpers ---
 fn write_ciphertexts(
@@ -370,41 +176,6 @@ fn read_ciphertexts(
         })?;
 
     Ok((c1, c2, g, f, h, c1_raw, c2_raw))
-}
-
-#[allow(dead_code)]
-fn write_scalars(path: &str, scalars: &[Scalar]) -> std::io::Result<()> {
-    let file = File::create(path)?;
-    let mut w = BufWriter::new(file);
-    w.write_all(&(scalars.len() as u64).to_le_bytes())?;
-    for s in scalars {
-        w.write_all(s.as_bytes())?;
-    }
-    w.flush()?;
-    let f = w.into_inner()?;
-    f.sync_all()?;
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn read_scalars(path: &str) -> std::io::Result<Vec<Scalar>> {
-    let file = File::open(path)?;
-    let mut r = BufReader::new(file);
-    let mut buf8 = [0u8; 8];
-    r.read_exact(&mut buf8)?;
-    let n = u64::from_le_bytes(buf8) as usize;
-    let mut out = Vec::with_capacity(n);
-    let mut buf32 = [0u8; 32];
-    for _ in 0..n {
-        r.read_exact(&mut buf32)?;
-        let s = Scalar::from_canonical_bytes(buf32)
-            .into_option()
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid scalar bytes")
-            })?;
-        out.push(s);
-    }
-    Ok(out)
 }
 
 
@@ -551,6 +322,26 @@ fn read_proof_bundle(
     ))
 }
 
+// Largest number of ciphertexts to benchmark, read from the environment
+// variable MAX_N (for example MAX_N=100000). Configurations with a larger
+// n are skipped. Without MAX_N, all configurations of the paper are run.
+fn max_n_from_env() -> usize {
+    match std::env::var("MAX_N") {
+        Err(_) => usize::MAX,
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(n) if n >= 1_000 => n,
+            _ => {
+                eprintln!(
+                    "ERROR: MAX_N must be a whole number of at least 1000 \
+                     (the smallest size in the paper), got \"{}\".",
+                    v
+                );
+                std::process::exit(2);
+            }
+        },
+    }
+}
+
 // --- Tables 1 and 2 - Prover and Verifier Performance---
 #[allow(unused_variables)]
 fn custom_benchmark(c: &mut Criterion) {
@@ -560,13 +351,35 @@ fn custom_benchmark(c: &mut Criterion) {
     {
         return;
     }
-    let quick_mode = std::env::var("QUICK")
-        .ok()
-        .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .is_some();
+    let quick_mode = match std::env::var("QUICK") {
+        Err(_) => false,
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+        Ok(v) => {
+            eprintln!("ERROR: QUICK must be 1 or 0, got \"{}\".", v);
+            std::process::exit(2);
+        }
+    };
+    // Size of the quick run: QUICK_N ciphertexts with k = 4 (default 1000).
+    // QUICK_N=1000000 gives the MAYA values of Table 3 of the paper.
+    let quick_n: usize = match std::env::var("QUICK_N") {
+        Err(_) => 1_000,
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(n) if n >= 10 => n,
+            _ => {
+                eprintln!(
+                    "ERROR: QUICK_N must be a whole number of at least 10, \
+                     got \"{}\".",
+                    v
+                );
+                std::process::exit(2);
+            }
+        },
+    };
+    let quick_configs = [(quick_n, 4)];
 
     let configs: &[(usize, usize)] = if quick_mode {
-        &[(1_000, 4)]
+        &quick_configs
     } else {
         &[
             (1_000, 2), (1_000, 4),
@@ -575,6 +388,12 @@ fn custom_benchmark(c: &mut Criterion) {
             (1_000_000, 2), (1_000_000, 4),
         ]
     };
+
+    // Skip configurations with n larger than MAX_N (see max_n_from_env).
+    let max_n = max_n_from_env();
+    let configs_kept: Vec<(usize, usize)> =
+        configs.iter().copied().filter(|&(n, _)| n <= max_n).collect();
+    let configs: &[(usize, usize)] = &configs_kept;
 
     let features = {
         let mut fv = Vec::new();
@@ -591,7 +410,10 @@ fn custom_benchmark(c: &mut Criterion) {
     println!("================================================================");
     if quick_mode {
         println!("  MAYA-Ristretto (Ristretto255 / curve25519-dalek)");
-        println!("  Running a single config (N=1000, k=4) to verify the benchmark");
+          println!(
+            "  Running a single config (N={}, k=4) to verify the benchmark",
+            quick_n
+        );
         println!("  wires up correctly. For full results, run without QUICK=1.");
         println!("  ----------------------------------------------------------------");
     }
@@ -711,10 +533,6 @@ fn custom_benchmark(c: &mut Criterion) {
 
         // [3] Rerandomization + Fiat-Shamir e
         let t_rerand_start = Instant::now();
-
-        #[cfg(all(feature = "parallel", not(feature = "production")))]
-        let r_values: Vec<Scalar> = (0..n_input).map(|j| deterministic_rand_scalar(j)).collect();
-        #[cfg(not(feature = "parallel"))]
         let r_values: Vec<Scalar> = (0..n_input).map(|_| Scalar::random(&mut rng)).collect();
 
         #[cfg(feature = "parallel")]
@@ -746,7 +564,7 @@ fn custom_benchmark(c: &mut Criterion) {
         let t_e_prover_start = Instant::now();
         let c1p_bytes = batch_compress(&c1_prime);
         let c2p_bytes = batch_compress(&c2_prime);
-        let input_padded = derive_challenge_e(
+        let (input_padded, e_seed) = derive_challenge_e(
             &pc_gens, &bp_gens, &c1_bytes, &c2_bytes, &c1p_bytes, &c2p_bytes, n_input, circuit_n,
         );
         let mut output_padded: Vec<Scalar> = indices.iter().map(|&i| input_padded[i]).collect();
@@ -766,6 +584,7 @@ fn custom_benchmark(c: &mut Criterion) {
             &pc_gens,
             &bp_gens,
             &mut prover_transcript,
+            &e_seed,
             &input_padded,
             &output_padded,
             &c1_prime,
@@ -810,7 +629,7 @@ fn custom_benchmark(c: &mut Criterion) {
 
         // [2] Derive e
         let t_e_start = Instant::now();
-        let input_padded_r = derive_challenge_e(
+        let (input_padded_r, e_seed_r) = derive_challenge_e(
             &v_pc_gens,
             &v_bp_gens,
             &c1_orig_bytes,
@@ -858,12 +677,15 @@ fn custom_benchmark(c: &mut Criterion) {
             &v_pc_gens,
             &v_bp_gens,
             &mut verifier_transcript,
+            &e_seed_r,
             &proof_r,
             &input_padded_r,
             out_commitment_r,
             &c1_prime_r,
             &c2_prime_r,
             &c_combined,
+            k,
+            d,
         );
         assert!(
             result.is_ok(),
@@ -916,7 +738,7 @@ fn custom_benchmark(c: &mut Criterion) {
         println!("    Rerandomization:              {:>14.2} ms", t_rerand_ms);
         println!("    Challenge e derivation:       {:>14.2} ms", t_e_prover_ms);
         println!("    Proof generation (*):         {:>14.2} ms", t_proof_gen_ms);
-        println!("    ─────────────────────────────────────────────────");
+        println!("    -------------------------------------------------");
         println!("    Total (excl. I/O):            {:>14.2} ms", total_prover);
         println!("    File I/O (read+write):        {:>14.2} ms", file_io);
         println!("    Total E2E (incl. I/O):        {:>14.2} ms", total_prover_e2e);
@@ -927,7 +749,7 @@ fn custom_benchmark(c: &mut Criterion) {
         println!("    Challenge e derivation:       {:>14.2} ms", t_e_derive_ms);
         println!("    RHS computation (Eq. 6):      {:>14.2} ms", t_rhs_ms);
         println!("    Proof verification (*):       {:>14.2} ms", t_verify_ms);
-        println!("    ────────────────────────────────────────────────");
+        println!("    ------------------------------------------------");
         println!("    Total (excl. I/O):            {:>14.2} ms", total_verifier);
         println!("    File I/O (read):              {:>14.2} ms", t_v_file_read_ms);
         println!("    Total E2E (incl. I/O):        {:>14.2} ms", total_verifier_e2e);
@@ -960,10 +782,6 @@ fn custom_benchmark(c: &mut Criterion) {
                 .collect();
             let mut idx_b: Vec<usize> = (0..n_input).collect();
             idx_b.shuffle(&mut rng_b);
-
-            #[cfg(all(feature = "parallel", not(feature = "production")))]
-            let rv_b: Vec<Scalar> = (0..n_input).map(|j| deterministic_rand_scalar(j)).collect();
-            #[cfg(not(feature = "parallel"))]
             let rv_b: Vec<Scalar> = (0..n_input).map(|_| Scalar::random(&mut rng_b)).collect();
 
             #[cfg(feature = "parallel")]
@@ -994,7 +812,7 @@ fn custom_benchmark(c: &mut Criterion) {
             let c2_b_bytes = batch_compress(&c2_b);
             let c1p_b_bytes = batch_compress(&c1p_b);
             let c2p_b_bytes = batch_compress(&c2p_b);
-            let inp_b = derive_challenge_e(
+            let (inp_b, e_seed_b) = derive_challenge_e(
                 &pc_gens,
                 &bp_gens,
                 &c1_b_bytes,
@@ -1021,6 +839,7 @@ fn custom_benchmark(c: &mut Criterion) {
                         &pc_gens,
                         &bp_gens,
                         &mut t,
+                        &e_seed_b,
                         &inp_b,
                         &out_b,
                         &c1p_b,
@@ -1055,10 +874,6 @@ fn custom_benchmark(c: &mut Criterion) {
                 .collect();
             let mut idx_v: Vec<usize> = (0..n_input).collect();
             idx_v.shuffle(&mut rng_v);
-
-            #[cfg(all(feature = "parallel", not(feature = "production")))]
-            let rv_v: Vec<Scalar> = (0..n_input).map(|j| deterministic_rand_scalar(j)).collect();
-            #[cfg(not(feature = "parallel"))]
             let rv_v: Vec<Scalar> = (0..n_input).map(|_| Scalar::random(&mut rng_v)).collect();
 
             #[cfg(feature = "parallel")]
@@ -1089,7 +904,7 @@ fn custom_benchmark(c: &mut Criterion) {
             let c2_v_bytes = batch_compress(&c2_v);
             let c1p_v_bytes = batch_compress(&c1p_v);
             let c2p_v_bytes = batch_compress(&c2p_v);
-            let inp_v = derive_challenge_e(
+            let (inp_v, e_seed_v) = derive_challenge_e(
                 &pc_gens,
                 &bp_gens,
                 &c1_v_bytes,
@@ -1121,6 +936,7 @@ fn custom_benchmark(c: &mut Criterion) {
                 &pc_gens,
                 &bp_gens,
                 &mut pt,
+                &e_seed_v,
                 &inp_v,
                 &out_v,
                 &c1p_v,
@@ -1136,8 +952,8 @@ fn custom_benchmark(c: &mut Criterion) {
                 b.iter(|| {
                     let mut t = Transcript::new(b"MAYA-Shuffle-v1");
                     let res = KShuffleGadget::verify(
-                        &pc_gens, &bp_gens, &mut t, &proof_v, &inp_v, out_com_v, &c1p_v, &c2p_v,
-                        &c_comb_v,
+                        &pc_gens, &bp_gens, &mut t, &e_seed_v, &proof_v, &inp_v, out_com_v,
+                        &c1p_v, &c2p_v, &c_comb_v, k, d,
                     );
                     assert!(res.is_ok(), "verifier bench failed: {:?}", res.err());
                 });
@@ -1275,7 +1091,7 @@ fn custom_benchmark(c: &mut Criterion) {
             for &k in ks {
                 match get_result(n, k) {
                     Some(r) => print!("  {:>14.2}", averaged_prover(r)),
-                    None => print!("  {:>14}", "—"),
+                    None => print!("  {:>14}", "-"),
                 }
             }
             println!();
@@ -1294,7 +1110,7 @@ fn custom_benchmark(c: &mut Criterion) {
             for &k in ks {
                 match get_result(n, k) {
                     Some(r) => print!("  {:>14.2}", averaged_verifier(r)),
-                    None => print!("  {:>14}", "—"),
+                    None => print!("  {:>14}", "-"),
                 }
             }
             println!();
@@ -1313,7 +1129,7 @@ fn custom_benchmark(c: &mut Criterion) {
             for &k in ks {
                 match get_result(n, k) {
                     Some(r) => print!("  {:>14}", r.proof_bytes),
-                    None => print!("  {:>14}", "—"),
+                    None => print!("  {:>14}", "-"),
                 }
             }
             println!();
@@ -1331,7 +1147,7 @@ criterion_group! {
     targets = custom_benchmark
 }
 
-// ---Table 12 - Padding Comparison (Appendix R)---
+// --- Section 4.4 - Padding strategies ---
 #[allow(unused_variables)]
 fn padding_comparison_benchmark(c: &mut Criterion) {
     if std::env::var("BENCH_PADDING").is_err() {
@@ -1340,7 +1156,7 @@ fn padding_comparison_benchmark(c: &mut Criterion) {
 
     println!();
     println!("================================================================");
-    println!("  Padding Comparison (Table 12)");
+    println!("  Padding Comparison (Section 4.4)");
     println!("  N = 2^20 + 1 = 1,048,577");
     println!("  Mode: {}", if cfg!(feature = "global_padding") { "Global" } else { "Iterative" });
     println!();
@@ -1377,6 +1193,26 @@ fn padding_comparison_benchmark(c: &mut Criterion) {
         PaddingConfig { k: 4, d: 10, label: "Maximal" },
         PaddingConfig { k: 5, d: 9,  label: "Maximal" },
     ];
+    
+     // Keep only one recursion regime if PADDING_TIER is set, for example
+    // PADDING_TIER=Maximal. Accepted values: Early-stop, Balanced, Deep,
+    // Maximal. Without PADDING_TIER, all 16 configurations are run.
+    let tier = std::env::var("PADDING_TIER").ok();
+    if let Some(t) = &tier {
+        if !configs.iter().any(|cfg| cfg.label == t.as_str()) {
+            eprintln!(
+                "ERROR: PADDING_TIER must be Early-stop, Balanced, Deep or \
+                 Maximal, got \"{}\".",
+                t
+            );
+            std::process::exit(2);
+        }
+    }
+    let configs_kept: Vec<&PaddingConfig> = configs
+        .iter()
+        .filter(|cfg| tier.as_deref().map_or(true, |t| t == cfg.label))
+        .collect();
+    let configs: &[&PaddingConfig] = &configs_kept;
 
     const N_INPUT: usize = 1_048_577; // 2^20 + 1
 
@@ -1451,7 +1287,7 @@ fn padding_comparison_benchmark(c: &mut Criterion) {
             batch_compress(&c1_prime),
             batch_compress(&c2_prime),
         );
-        let input_padded = derive_challenge_e(
+        let (input_padded, e_seed) = derive_challenge_e(
             &pc_gens, &bp_gens, &c1_raw_b, &c2_raw_b, &c1p_b, &c2p_b, N_INPUT, circuit_n,
         );
 
@@ -1472,6 +1308,7 @@ fn padding_comparison_benchmark(c: &mut Criterion) {
                 &pc_gens,
                 &bp_gens,
                 &mut t_prove,
+                &e_seed,
                 &input_padded,
                 &output_padded,
                 &c1_prime,
@@ -1491,15 +1328,18 @@ fn padding_comparison_benchmark(c: &mut Criterion) {
             ];
             let mut t_verify_ts = Transcript::new(b"MAYA-Shuffle-v1");
             let result = KShuffleGadget::verify(
-                &v_pc_gens,
-                &v_bp_gens,
-                &mut t_verify_ts,
-                &proof,
-                &input_padded,
-                out_commitment,
-                &c1_prime,
-                &c2_prime,
-                &c_combined,
+                    &v_pc_gens,
+                    &v_bp_gens,
+                    &mut t_verify_ts,
+                    &e_seed,
+                    &proof,
+                    &input_padded,
+                    out_commitment,
+                    &c1_prime,
+                    &c2_prime,
+                    &c_combined,
+                    k,
+                    d,
             );
             assert!(
                 result.is_ok(),
@@ -1520,7 +1360,7 @@ fn padding_comparison_benchmark(c: &mut Criterion) {
                 let mut t = Transcript::new(b"MAYA-Shuffle-v1");
                 let mut bench_rng = rand::thread_rng();
                 KShuffleGadget::prove(
-                    &pc_gens, &bp_gens, &mut t,
+                    &pc_gens, &bp_gens, &mut t, &e_seed,
                     &input_padded, &output_padded,
                     &c1_prime, &c2_prime,
                     r_prime, k, d,
@@ -1556,7 +1396,7 @@ fn padding_comparison_benchmark(c: &mut Criterion) {
 
     println!();
     println!("================================================================");
-    println!("  Table 12: {} padding - proof generation time (ms)",
+    println!("  Section 4.4: {} padding - proof generation time (ms)",
         if cfg!(feature = "global_padding") { "Global" } else { "Iterative" });
     println!("  N = 1,048,577");
     println!();
@@ -1575,7 +1415,7 @@ fn padding_comparison_benchmark(c: &mut Criterion) {
         let m = (N_INPUT + k_pow_d - 1) / k_pow_d;
         match read_padding_mean_ms(cfg_item.label, k, d, m) {
             Some(ms) => println!("  {:>12} {:>5} {:>5} {:>14.2}", cfg_item.label, k, d, ms),
-            None     => println!("  {:>12} {:>5} {:>5} {:>14}", cfg_item.label, k, d, "—"),
+            None     => println!("  {:>12} {:>5} {:>5} {:>14}", cfg_item.label, k, d, "-"),
         }
     }
     println!();
@@ -1589,7 +1429,7 @@ criterion_group! {
     targets = padding_comparison_benchmark
 }
 
-//---Figure 3 - Folding Factor Sweet Spot---
+// --- Figure 5 - Folding Factor Sweet Spot ---
 fn folding_factor_benchmark(c: &mut Criterion) {
     if std::env::var("BENCH_FOLDING").is_err() {
         return;
@@ -1597,9 +1437,15 @@ fn folding_factor_benchmark(c: &mut Criterion) {
     let n_values: &[usize] = &[1_000, 10_000, 100_000, 1_000_000];
     let k_values: &[usize] = &[2, 3, 4, 5, 6, 8, 16];
 
+    // Skip input sizes larger than MAX_N (see max_n_from_env).
+    let max_n = max_n_from_env();
+    let n_values_kept: Vec<usize> =
+        n_values.iter().copied().filter(|&n| n <= max_n).collect();
+    let n_values: &[usize] = &n_values_kept;
+
     println!();
     println!("================================================================");
-    println!("  Folding Factor Sweep (Figure 3)");
+    println!("  Folding Factor Sweep (Figure 5)");
     println!("  N = {{10^3, 10^4, 10^5, 10^6}}, k = {{2, 3, 4, 5, 6, 8, 16}}");
     println!();
     println!("  Measuring proof generation time only, since this is where");
@@ -1662,7 +1508,7 @@ fn folding_factor_benchmark(c: &mut Criterion) {
                 batch_compress(&c1_prime),
                 batch_compress(&c2_prime),
             );
-            let input_padded = derive_challenge_e(
+            let (input_padded, e_seed) = derive_challenge_e(
                 &pc_gens, &bp_gens, &c1_raw_b, &c2_raw_b, &c1p_b, &c2p_b, n_input, circuit_n,
             );
 
@@ -1683,6 +1529,7 @@ fn folding_factor_benchmark(c: &mut Criterion) {
                     &pc_gens,
                     &bp_gens,
                     &mut t_prove,
+                    &e_seed,
                     &input_padded,
                     &output_padded,
                     &c1_prime,
@@ -1705,12 +1552,15 @@ fn folding_factor_benchmark(c: &mut Criterion) {
                     &v_pc_gens,
                     &v_bp_gens,
                     &mut t_verify_ts,
+                    &e_seed,
                     &proof,
                     &input_padded,
                     out_commitment,
                     &c1_prime,
                     &c2_prime,
                     &c_combined,
+                    k_fold,
+                    d,
                 );
                 assert!(
                     result.is_ok(),
@@ -1731,6 +1581,7 @@ fn folding_factor_benchmark(c: &mut Criterion) {
                         &pc_gens,
                         &bp_gens,
                         &mut t,
+                        &e_seed,
                         &input_padded,
                         &output_padded,
                         &c1_prime,
@@ -1748,7 +1599,7 @@ fn folding_factor_benchmark(c: &mut Criterion) {
 
     println!();
     println!("================================================================");
-    println!("  Figure 3: Proof generation time normalized to k=2");
+    println!("  Figure 5: Proof generation time normalized to k=2");
     println!();
     println!("  Criterion reports the slope estimate on screen by default (linear");
     println!("  regression of time vs iteration count). The summary table");
@@ -1808,7 +1659,7 @@ fn folding_factor_benchmark(c: &mut Criterion) {
                     print!("  {:>7.3}", t_k / t_2);
                 }
                 _ => {
-                    print!("  {:>7}", "—");
+                    print!("  {:>7}", "-");
                 }
             }
         }
@@ -1833,10 +1684,20 @@ fn full_averaging_benchmark(_c: &mut Criterion) {
         return;
     }
 
-    let num_runs: usize = std::env::var("NUM_RUNS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10);
+    let num_runs: usize = match std::env::var("NUM_RUNS") {
+        Err(_) => 10,
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(r) if r >= 1 => r,
+            _ => {
+                eprintln!(
+                    "ERROR: NUM_RUNS must be a whole number of at least 1, \
+                     got \"{}\".",
+                    v
+                );
+                std::process::exit(2);
+            }
+        },
+    };
 
     let configs: &[(usize, usize)] = &[
         (1_000, 2), (1_000, 4),
@@ -1854,6 +1715,12 @@ fn full_averaging_benchmark(_c: &mut Criterion) {
     println!("  Features: {}", if cfg!(feature = "parallel") { "multi-threaded" } else { "single-threaded" });
     println!("================================================================");
     println!();
+
+    // Skip configurations with n larger than MAX_N (see max_n_from_env).
+    let max_n = max_n_from_env();
+    let configs_kept: Vec<(usize, usize)> =
+        configs.iter().copied().filter(|&(n, _)| n <= max_n).collect();
+    let configs: &[(usize, usize)] = &configs_kept;
 
     for &(n_input, k) in configs {
         let n_padded = n_input + (k - 1) + 1;
@@ -1920,9 +1787,6 @@ fn full_averaging_benchmark(_c: &mut Criterion) {
             indices.shuffle(&mut rng);
 
             // Rerandomization
-            #[cfg(all(feature = "parallel", not(feature = "production")))]
-            let r_values: Vec<Scalar> = (0..n_input).map(|j| deterministic_rand_scalar(j)).collect();
-            #[cfg(not(feature = "parallel"))]
             let r_values: Vec<Scalar> = (0..n_input).map(|_| Scalar::random(&mut rng)).collect();
 
             #[cfg(feature = "parallel")]
@@ -1949,7 +1813,7 @@ fn full_averaging_benchmark(_c: &mut Criterion) {
             // Challenge e derivation
             let c1p_bytes = batch_compress(&c1_prime);
             let c2p_bytes = batch_compress(&c2_prime);
-            let input_padded = derive_challenge_e(
+            let (input_padded, e_seed) = derive_challenge_e(
                 &run_pc, &run_bp, &c1_bytes, &c2_bytes, &c1p_bytes, &c2p_bytes, n_input, circuit_n,
             );
             let mut output_padded: Vec<Scalar> = indices.iter().map(|&i| input_padded[i]).collect();
@@ -1964,7 +1828,7 @@ fn full_averaging_benchmark(_c: &mut Criterion) {
             // Proof generation
             let mut pt = Transcript::new(b"MAYA-Shuffle-v1");
             let (proof, out_commitment) = KShuffleGadget::prove(
-                &run_pc, &run_bp, &mut pt,
+                &run_pc, &run_bp, &mut pt, &e_seed,
                 &input_padded, &output_padded,
                 &c1_prime, &c2_prime,
                 r_prime, k, d, &mut rng,
@@ -1988,7 +1852,7 @@ fn full_averaging_benchmark(_c: &mut Criterion) {
             let v_bp = BulletproofGens::new(n_padded, 1);
 
             // Challenge e re-derivation
-            let input_padded_v = derive_challenge_e(
+           let (input_padded_v, e_seed_v) = derive_challenge_e(
                 &v_pc, &v_bp, &c1_bytes, &c2_bytes, &c1p_bytes, &c2p_bytes, n_input, circuit_n,
             );
 
@@ -2015,9 +1879,9 @@ fn full_averaging_benchmark(_c: &mut Criterion) {
             // Proof verification
             let mut vt = Transcript::new(b"MAYA-Shuffle-v1");
             let res = KShuffleGadget::verify(
-                &v_pc, &v_bp, &mut vt, &proof,
+                &v_pc, &v_bp, &mut vt, &e_seed_v, &proof,
                 &input_padded_v, out_commitment,
-                &c1_prime, &c2_prime, &c_combined,
+                &c1_prime, &c2_prime, &c_combined, k, d,
             );
             assert!(res.is_ok(), "full_avg: verify failed N={}/k={}/d={}", n_input, k, d);
 

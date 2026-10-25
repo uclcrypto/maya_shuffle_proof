@@ -1,11 +1,18 @@
 # MAYA: A Short Shuffle Argument With Fast Verification
 
-This repository contains a Rust implementation of the MAYA shuffle argument with
-O(log n) communication complexity. Two curve instantiations are provided: one based on
-curve25519-dalek (Ristretto255) and one based on the arkworks library (NIST P-256).
-This repository accompanies the MAYA paper accepted at CCS ’26.
+> **Research code.** This is a research prototypeonly -- for benchmarking and experimentation. Not audited, no correctness or security guarantees. Do NOT use in production or any deployed system.
 
-More information about MAYA, including a verifier-oriented specification, is available on the https://thaodoanvan.github.io/maya_website/.
+This repository contains a Rust implementation of the MAYA shuffle argument, a shuffle argument with
+`O(log n)` proof size and fast verification. Two curve instantiations are
+provided: MAYA-Ristretto on curve25519-dalek (Ristretto255) and MAYA-P256 on
+arkworks (NIST P-256).  The repository accompanies the MAYA paper accepted at CCS ’26.
+
+- Paper: MAYA, ACM CCS 2026. Full version: <https://eprint.iacr.org/2026/941>
+- Verifier-oriented specification and further material:
+  <https://thaodoanvan.github.io/maya_website/>
+- Archived artifact, with the full evaluation instructions and the Verificatum
+  baseline scripts: <https://doi.org/10.5281/zenodo.22647683>
+
 
 
 ## Requirements
@@ -13,28 +20,31 @@ More information about MAYA, including a verifier-oriented specification, is ava
 - **Hardware**: x86-64 CPU, minimum 8 GB RAM (16 GB is recommended)
 - **Software**: Rust >= 1.81 (install via [rustup](https://rustup.rs))
 
-## Repository Structure
+
+## Repository structure
 
 ```
-maya_ristretto/       # Primary instantiation (Ristretto255, curve25519-dalek)
-  src/                # Library source
-  benches/r1cs.rs     # Benchmark: prover and verifier timing
-  Cargo.toml
-maya_p256/            # Secondary instantiation (NIST P-256, arkworks)
-  src/                # Library source
-  benches/r1cs.rs     # Benchmark: prover and verifier timing
-  Cargo.toml
-Verificatum_singlecore.sh   # Baseline: Verificatum single-threaded
-Verificatum_multicore.sh    # Baseline: Verificatum multi-threaded
-README.md
+maya_ristretto/              # Primary instantiation (Ristretto255, curve25519-dalek)
+  src/                       # Library source
+  tests/                     # Integration tests
+  benches/r1cs.rs            # Benchmark: prover and verifier timing
+  docs/                      # Notes inherited from Bulletproofs                   
+maya_p256/                   # Secondary instantiation (NIST P-256, arkworks)
+  src/                       # Library source
+  tests/  
+  benches/r1cs.rs            # Benchmark: prover and verifier timing                        
+LICENSE-MIT
+README.md                      
 ```
 
-## Quick Start
+
+## Quick start
 
 ```bash
 cd maya_ristretto
 cargo build --release --features yoloproofs,parallel
-QUICK=1 RUSTFLAGS='-C target_cpu=native' cargo bench --bench r1cs --features yoloproofs,parallel
+QUICK=1 RUSTFLAGS='-C target_cpu=native' \
+  cargo bench --bench r1cs --features yoloproofs,parallel
 ```
 
 **Notes**
@@ -42,6 +52,14 @@ QUICK=1 RUSTFLAGS='-C target_cpu=native' cargo bench --bench r1cs --features yol
 - First benchmark run may take some minutes due to dependency compilation.
 - Benchmark timings are more stable after the initial build.
 - For stable numbers, run while plugged in and avoid background load.
+
+
+## Tests
+
+```bash
+cd maya_ristretto && cargo test --release --features yoloproofs
+cd ../maya_p256   && cargo test --release --features yoloproofs
+```
 
 ## Reproducing Paper Results
 
@@ -116,13 +134,6 @@ BENCH_FULL_AVG=1 RUSTFLAGS='-C target_cpu=native' cargo bench --bench r1cs --fea
 
 Default is 10 runs/config to keep runtime manageable. Override with NUM_RUNS=100.
 
-### Verificatum Baseline (Tables 1-2, Verificatum column)
-
-Requires Verificatum v3.1.0 and Java 17+. See https://www.verificatum.org/.
-```bash
-./Verificatum_singlecore.sh
-./Verificatum_multicore.sh
-```
 
 ## Result Mapping
 
@@ -138,7 +149,17 @@ Requires Verificatum v3.1.0 and Java 17+. See https://www.verificatum.org/.
 | MAYA-P256 | Tables 8–11 | `cd maya_p256 && cargo bench ...` |
 | Verificatum baseline | Tables 1–2 | `./Verificatum_singlecore.sh` or `./Verificatum_multicore.sh` |
 | Full averaging | Tables 1–2 | `BENCH_FULL_AVG=1 cargo bench ...` |
+
+
 ## Interpreting Results
 
 The numbers in the paper were measured on an Intel Core i5-1245U (12 threads, 4.4 GHz), 16 GB RAM,
 Ubuntu 22.04, rustc 1.88.0.
+
+
+## License
+
+MAYA is developed by the UCLouvain Crypto Group and released under the
+MIT License (see `LICENSE-MIT`). It extends the Bulletproofs library of
+dalek-cryptography, distributed under the MIT License,
+Copyright (c) 2018 Chain, Inc.; this notice is kept in `LICENSE-MIT`.

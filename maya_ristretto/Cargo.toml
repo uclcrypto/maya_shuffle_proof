@@ -3,7 +3,7 @@ name = "maya_ristretto"
 version = "1.0.1"
 edition = "2015"
 readme = "README.md"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 categories = ["cryptography"]
 keywords = ["cryptography", "ristretto", "zero-knowledge"]
 autobenches = false
@@ -22,18 +22,22 @@ merlin = "3"
 zeroize = "1"
 clap = "2.33"
 rayon = { version = "1.10", optional = true }
+rand_chacha = "0.3"
 
 [dev-dependencies]
 hex = "0.4"
 criterion = "0.4"
 bincode = "1"
-rand_chacha = "0.3"
 
 [features]
 parallel = ["rayon"]
 yoloproofs = []
-production = []
 global_padding = []
+
+
+[[test]]
+name = "shuffle"
+required-features = ["yoloproofs"]
 
 [[bench]]
 name = "r1cs"

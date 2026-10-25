@@ -1,9 +1,7 @@
 #![allow(non_snake_case)]
 #![allow(non_camel_case_types)]
 #![allow(deprecated)]
-#![allow(unused_assignments)]
-#![allow(unused_mut)]
-#![allow(dead_code)]
+#![cfg_attr(not(feature = "yoloproofs"), allow(dead_code))]
 #![allow(non_local_definitions)]
 #![allow(missing_docs)]
 //#![feature(nll)]
@@ -21,6 +19,7 @@ extern crate sha3;
 
 extern crate curve25519_dalek;
 extern crate merlin;
+extern crate rand_chacha;
 extern crate serde;
 extern crate serde_derive;
 extern crate subtle;
@@ -59,4 +58,6 @@ pub mod range_proof_mpc {
 
 #[cfg(feature = "yoloproofs")]
 pub mod r1cs;
+#[cfg(feature = "yoloproofs")]
+pub mod shuffle;
 

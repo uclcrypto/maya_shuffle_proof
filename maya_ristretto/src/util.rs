@@ -214,6 +214,7 @@ impl Drop for Poly6 {
 /// Raises `x` to the power `n` using binary exponentiation,
 /// with (1 to 2)*lg(n) scalar multiplications.
 /// TODO: a consttime version of this would be awfully similar to a Montgomery ladder.
+#[cfg(test)]
 pub fn scalar_exp_vartime(x: &Scalar, mut n: u64) -> Scalar {
     let mut result = Scalar::ONE;
     let mut aux = *x; // x, x^2, x^4, x^8, ...
@@ -232,6 +233,7 @@ pub fn scalar_exp_vartime(x: &Scalar, mut n: u64) -> Scalar {
 /// If `n` is a power of 2, it uses the efficient algorithm with `2*lg n` multiplications and additions.
 /// If `n` is not a power of 2, it uses the slow algorithm with `n` multiplications and additions.
 /// In the Bulletproofs case, all calls to `sum_of_powers` should have `n` as a power of 2.
+#[cfg(test)]
 pub fn sum_of_powers(x: &Scalar, n: usize) -> Scalar {
     if !n.is_power_of_two() {
         return sum_of_powers_slow(x, n);
@@ -251,6 +253,7 @@ pub fn sum_of_powers(x: &Scalar, n: usize) -> Scalar {
 }
 
 // takes the sum of all of the powers of x, up to n
+#[cfg(test)]
 fn sum_of_powers_slow(x: &Scalar, n: usize) -> Scalar {
     exp_iter(*x).take(n).sum()
 }

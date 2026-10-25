@@ -90,6 +90,18 @@ impl Iterator for GeneratorsChain {
     }
 }
 
+/// Padding generators of one round of a `k`-ary folding argument, derived by hash-to-group 
+pub(crate) fn fold_pad_generators(
+    domain: &[u8],
+    seed: &[u8; 32],
+    count: usize,
+) -> Vec<RistrettoPoint> {
+    let mut label = Vec::with_capacity(domain.len() + seed.len());
+    label.extend_from_slice(domain);
+    label.extend_from_slice(seed);
+    GeneratorsChain::new(&label).take(count).collect()
+}
+
 ///
 #[derive(Clone)]
 pub struct BulletproofGens {
@@ -98,7 +110,6 @@ pub struct BulletproofGens {
     /// Number of values or parties
     pub party_capacity: usize,
     /// Precomputed \\(\mathbf G\\) generators for each party.
-    // NOTE: add pub G_vec so that we can pass the references in "prove_ipa"
     pub G_vec: Vec<Vec<RistrettoPoint>>,
     /// Precomputed \\(\mathbf H\\) generators for each party.
     pub H_vec: Vec<Vec<RistrettoPoint>>,
@@ -202,6 +213,7 @@ impl BulletproofGens {
     }
 
     /// Return an iterator over the aggregation of the parties' H generators with given size `n`.
+    #[cfg(test)]
     pub(crate) fn H(&self, n: usize, m: usize) -> impl Iterator<Item = &RistrettoPoint> {
         AggregatedGensIter {
             n,

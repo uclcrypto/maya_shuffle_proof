@@ -1,8 +1,5 @@
 #![allow(non_snake_case)]
 #![allow(non_camel_case_types)]
-#![allow(unused_assignments)]
-#![allow(unused_mut)]
-#![allow(dead_code)]
 
 pub mod errors;
 pub mod fixed_base;
@@ -17,4 +14,6 @@ pub use generators::{BulletproofGens, BulletproofGensShare, PedersenGens};
 
 #[cfg(feature = "yoloproofs")]
 pub mod r1cs;
+#[cfg(feature = "yoloproofs")]
+pub mod shuffle;
 

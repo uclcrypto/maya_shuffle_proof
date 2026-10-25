@@ -9,18 +9,26 @@ use merlin::Transcript;
 use rayon::prelude::*;
 
 use errors::ProofError;
+use generators::fold_pad_generators;
 use std::convert::TryInto;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use transcript::TranscriptProtocol;
 
 static IPP_TIMING_PRINTED: AtomicBool = AtomicBool::new(false);
-static ECP_TIMING_PRINTED: AtomicBool = AtomicBool::new(false);
 
+pub(crate) const IPA_PAD_G_DOMAIN: &[u8] = b"MAYA-ipa-pad-g-v1";
+pub(crate) const IPA_PAD_H_DOMAIN: &[u8] = b"MAYA-ipa-pad-h-v1";
+pub(crate) const ECP_PAD_G_DOMAIN: &[u8] = b"MAYA-ecp-pad-G-v1";
+pub(crate) const MAX_FOLD_FACTOR: usize = 64;
+pub(crate) const MAX_FOLD_ROUNDS: usize = 64;
+
+#[cfg(feature = "parallel")]
 struct KnownSizeIter<I: Iterator> {
     inner: I,
     remaining: usize,
 }
+#[cfg(feature = "parallel")]
 impl<I: Iterator> KnownSizeIter<I> {
     fn new(inner: I, size: usize) -> Self {
         Self {
@@ -29,6 +37,7 @@ impl<I: Iterator> KnownSizeIter<I> {
         }
     }
 }
+#[cfg(feature = "parallel")]
 impl<I: Iterator> Iterator for KnownSizeIter<I> {
     type Item = I::Item;
     fn next(&mut self) -> Option<I::Item> {
@@ -41,6 +50,7 @@ impl<I: Iterator> Iterator for KnownSizeIter<I> {
         (self.remaining, Some(self.remaining))
     }
 }
+#[cfg(feature = "parallel")]
 impl<I: Iterator> ExactSizeIterator for KnownSizeIter<I> {}
 
 fn scalar_pow(base: Scalar, mut exp: u64) -> Scalar {
@@ -54,6 +64,19 @@ fn scalar_pow(base: Scalar, mut exp: u64) -> Scalar {
         exp >>= 1;
     }
     result
+}
+
+#[cfg(test)]
+pub(crate) fn fold_pad_counts(n: usize, k: usize, d: usize) -> Vec<usize> {
+    let lengths = reconstruct_round_lengths(n, k, d);
+    (0..d).map(|r| lengths[r + 1] * k - lengths[r]).collect()
+}
+
+pub(crate) fn pad_seed(transcript: &mut Transcript, round: usize) -> [u8; 32] {
+    transcript.append_message(b"pad_round", &(round as u64).to_le_bytes());
+    let mut seed = [0u8; 32];
+    transcript.challenge_bytes(b"pad_seed", &mut seed);
+    seed
 }
 
 fn reconstruct_round_lengths(mut n: usize, k: usize, d: usize) -> Vec<usize> {
@@ -126,24 +149,17 @@ impl prove_ipa {
         let mut n_j = n;
 
         for j in 0..num_rounds {
-            let _t_round = Instant::now();
+           let _t_round = Instant::now();
 
-            #[cfg(not(feature = "global_padding"))]
-            {
-                let rem = n_j % k;
-                if rem != 0 {
-                    let pad = k - rem;
-                    a_curr.extend(std::iter::repeat(Scalar::ZERO).take(pad));
-                    b_curr.extend(std::iter::repeat(Scalar::ZERO).take(pad));
-                    g_curr.extend(std::iter::repeat(RistrettoPoint::default()).take(pad));
-                    h_curr.extend(std::iter::repeat(RistrettoPoint::default()).take(pad));
-                    n_j += pad;
-                }
-            }
-            #[cfg(feature = "global_padding")]
-            {
-                debug_assert_eq!(n_j % k, 0,
-                    "global_padding: n_j={} must be divisible by k={} (caller must pre-pad to m*k^d)", n_j, k);
+            let rem = n_j % k;
+            if rem != 0 {
+                let pad = k - rem;
+                a_curr.extend(std::iter::repeat(Scalar::ZERO).take(pad));
+                b_curr.extend(std::iter::repeat(Scalar::ZERO).take(pad));
+                let seed = pad_seed(transcript, j);
+                g_curr.extend(fold_pad_generators(IPA_PAD_G_DOMAIN, &seed, pad));
+                h_curr.extend(fold_pad_generators(IPA_PAD_H_DOMAIN, &seed, pad));
+                n_j += pad;
             }
 
             let m_j = n_j / k;
@@ -363,12 +379,30 @@ impl prove_ipa {
         &self,
         n: usize,
         transcript: &mut Transcript,
-    ) -> Result<(Vec<Scalar>, Vec<Scalar>, Scalar, Scalar, Vec<Scalar>), ProofError> {
+    ) -> Result<
+        (
+            Vec<Scalar>,
+            Vec<Scalar>,
+            Scalar,
+            Scalar,
+            Vec<Scalar>,
+            Vec<Scalar>,
+            Vec<RistrettoPoint>,
+        ),
+        ProofError,
+    > {
         let k = self.k;
         if n == 0 {
             return Err(ProofError::InvalidGeneratorsLength);
         }
         let d = self.U_vecs.len();
+        if k < 2
+            || k > MAX_FOLD_FACTOR
+            || d > MAX_FOLD_ROUNDS
+            || self.U_vecs.iter().any(|round| round.len() != 2 * k - 2)
+        {
+            return Err(ProofError::FormatError);
+        }
 
         let round_lengths = reconstruct_round_lengths(n, k, d);
         let m = *round_lengths.last().unwrap();
@@ -382,8 +416,16 @@ impl prove_ipa {
         transcript.append_message(b"k", &(k as u64).to_le_bytes());
 
         let mut challenges: Vec<Scalar> = Vec::with_capacity(d);
+        let mut pad_points: Vec<RistrettoPoint> = Vec::new();
+        let mut h_pad_points: Vec<RistrettoPoint> = Vec::new();
 
         for r in 0..d {
+            let pad = round_lengths[r + 1] * k - round_lengths[r];
+            if pad > 0 {
+                let seed = pad_seed(transcript, r);
+                pad_points.extend(fold_pad_generators(IPA_PAD_G_DOMAIN, &seed, pad));
+                h_pad_points.extend(fold_pad_generators(IPA_PAD_H_DOMAIN, &seed, pad));
+            }
             for i_list in 0..(2 * k - 2) {
                 transcript.append_message(b"U_round", &(r as u64).to_le_bytes());
                 transcript.append_message(b"U_index", &(i_list as u64).to_le_bytes());
@@ -397,7 +439,6 @@ impl prove_ipa {
         let mut challenges_inv = challenges.clone();
         Scalar::batch_invert(&mut challenges_inv);
 
-        let mut s_P = Scalar::ONE;
         let k_minus_1_exp = (k - 1) as u64;
         let mut c_k_minus_1_products = vec![Scalar::ONE; d];
         let mut product_so_far = Scalar::ONE;
@@ -406,7 +447,10 @@ impl prove_ipa {
             c_k_minus_1_products[r] = product_so_far;
             product_so_far *= c_k_minus_1;
         }
-        s_P = product_so_far;
+        let s_P = product_so_far;
+
+        let mut s_g_pad_rounds: Vec<Vec<Scalar>> = vec![Vec::new(); d];
+        let mut s_h_pad_rounds: Vec<Vec<Scalar>> = vec![Vec::new(); d];
 
         let mut s_g_full = self.a_final.clone();
         for r in (0..d).rev() {
@@ -425,7 +469,7 @@ impl prove_ipa {
                 }
             }
 
-            next_s.truncate(round_lengths[r]);
+            s_g_pad_rounds[r] = next_s.split_off(round_lengths[r]);
             s_g_full = next_s;
         }
         for x in s_g_full.iter_mut() {
@@ -449,7 +493,7 @@ impl prove_ipa {
                 }
             }
 
-            next_s.truncate(round_lengths[r]);
+            s_h_pad_rounds[r] = next_s.split_off(round_lengths[r]);
             s_h_full = next_s;
         }
 
@@ -469,7 +513,15 @@ impl prove_ipa {
             }
         }
 
-        Ok((s_g_full, s_h_full, s_Q_final, s_P, s_U))
+        let mut s_pad: Vec<Scalar> = Vec::with_capacity(2 * pad_points.len());
+        for r in 0..d {
+            let factor = c_k_minus_1_products[r] * scalar_pow(challenges[r], k_minus_1_exp);
+            s_pad.extend(s_g_pad_rounds[r].iter().map(|x| x * factor));
+        }
+        s_pad.extend(s_h_pad_rounds.into_iter().flatten());
+        pad_points.extend(h_pad_points);
+
+        Ok((s_g_full, s_h_full, s_Q_final, s_P, s_U, s_pad, pad_points))
     }
 
     pub fn serialized_size(&self) -> usize {
@@ -526,6 +578,24 @@ impl prove_ipa {
         let m_bytes = read32(&slice[pos..]);
         let m = u64::from_le_bytes(m_bytes[..8].try_into().unwrap()) as usize;
         pos += 32;
+
+        if k < 2
+            || k > MAX_FOLD_FACTOR
+            || d > MAX_FOLD_ROUNDS
+            || m == 0
+            || k_bytes[8..].iter().chain(&d_bytes[8..]).chain(&m_bytes[8..]).any(|&x| x != 0)
+        {
+            return Err(ProofError::FormatError);
+        }
+        let expected_len = m
+            .checked_mul(2)
+            .and_then(|s| s.checked_add(d * (2 * k - 2)))
+            .and_then(|w| w.checked_add(3))
+            .and_then(|w| w.checked_mul(32))
+            .ok_or(ProofError::FormatError)?;
+        if b != expected_len {
+            return Err(ProofError::FormatError);
+        }
 
         let points_per_round = 2 * k - 2;
         let mut U_vecs = Vec::with_capacity(d);
@@ -616,21 +686,14 @@ impl prove_ecp {
         let mut n_j = n;
 
         for round_idx in 0..num_rounds {
-            #[cfg(not(feature = "global_padding"))]
-            {
-                let rem = n_j % k;
-                if rem != 0 {
-                    let pad = k - rem;
-                    a_curr.extend(std::iter::repeat(Scalar::ZERO).take(pad));
-                    G_curr.extend(std::iter::repeat(RistrettoPoint::default()).take(pad));
-                    C1_curr.extend(std::iter::repeat(RistrettoPoint::default()).take(pad));
-                    n_j += pad;
-                }
-            }
-            #[cfg(feature = "global_padding")]
-            {
-                debug_assert_eq!(n_j % k, 0,
-                    "global_padding: n_j={} must be divisible by k={} (caller must pre-pad to m*k^d)", n_j, k);
+            let rem = n_j % k;
+            if rem != 0 {
+                let pad = k - rem;
+                a_curr.extend(std::iter::repeat(Scalar::ZERO).take(pad));
+                let seed = pad_seed(transcript, round_idx);
+                G_curr.extend(fold_pad_generators(ECP_PAD_G_DOMAIN, &seed, pad));
+                C1_curr.extend(std::iter::repeat(RistrettoPoint::default()).take(pad));
+                n_j += pad;
             }
 
             let m_j = n_j / k;
@@ -851,9 +914,19 @@ impl prove_ecp {
         &self,
         n: usize,
         transcript: &mut Transcript,
-    ) -> Result<(Vec<Scalar>, Scalar, Vec<Scalar>), ProofError> {
+    ) -> Result<(Vec<Scalar>, Scalar, Vec<Scalar>, Vec<Scalar>, Vec<RistrettoPoint>), ProofError> {
         let k = self.k;
+        if n == 0 {
+            return Err(ProofError::InvalidGeneratorsLength);
+        }
         let d = self.A_vecs.len();
+        if k < 2
+            || k > MAX_FOLD_FACTOR
+            || d > MAX_FOLD_ROUNDS
+            || self.A_vecs.iter().any(|round| round.len() != 2 * k - 2)
+        {
+            return Err(ProofError::FormatError);
+        }
 
         let round_lengths = reconstruct_round_lengths(n, k, d);
         let m = *round_lengths.last().unwrap();
@@ -867,7 +940,13 @@ impl prove_ecp {
         transcript.append_message(b"k", &(k as u64).to_le_bytes());
 
         let mut challenges: Vec<Scalar> = Vec::with_capacity(d);
+        let mut pad_points: Vec<RistrettoPoint> = Vec::new();
         for r in 0..d {
+            let pad = round_lengths[r + 1] * k - round_lengths[r];
+            if pad > 0 {
+                let seed = pad_seed(transcript, r);
+                pad_points.extend(fold_pad_generators(ECP_PAD_G_DOMAIN, &seed, pad));
+            }
             for i_list in 0..(2 * k - 2) {
                 let tuple = self.A_vecs[r][i_list];
                 transcript.append_message(b"A_round", &(r as u64).to_le_bytes());
@@ -883,7 +962,6 @@ impl prove_ecp {
         let mut challenges_inv = challenges.clone();
         Scalar::batch_invert(&mut challenges_inv);
 
-        let mut s_P = Scalar::ONE;
         let k_exp = k as u64;
         let mut c_k_products = vec![Scalar::ONE; d];
         let mut product_so_far = Scalar::ONE;
@@ -892,7 +970,9 @@ impl prove_ecp {
             c_k_products[r] = product_so_far;
             product_so_far *= c_k;
         }
-        s_P = product_so_far;
+        let s_P = product_so_far;
+
+        let mut z_s_pad_rounds: Vec<Vec<Scalar>> = vec![Vec::new(); d];
 
         let mut z_s_vec = self.z.clone();
         for r in (0..d).rev() {
@@ -911,7 +991,7 @@ impl prove_ecp {
                 }
             }
 
-            next_s.truncate(round_lengths[r]);
+            z_s_pad_rounds[r] = next_s.split_off(round_lengths[r]);
             z_s_vec = next_s;
         }
 
@@ -931,7 +1011,13 @@ impl prove_ecp {
             }
         }
 
-        Ok((z_s_vec, s_P, s_A_vec))
+        let mut z_s_pad: Vec<Scalar> = Vec::new();
+        for r in 0..d {
+            let factor = c_k_products[r] * scalar_pow(challenges[r], k_exp);
+            z_s_pad.extend(z_s_pad_rounds[r].iter().map(|x| x * factor));
+        }
+
+        Ok((z_s_vec, s_P, s_A_vec, z_s_pad, pad_points))
     }
 
     pub fn serialized_size(&self) -> usize {
@@ -989,6 +1075,23 @@ impl prove_ecp {
         let m = u64::from_le_bytes(m_bytes[..8].try_into().unwrap()) as usize;
         pos += 32;
 
+        if k < 2
+            || k > MAX_FOLD_FACTOR
+            || d > MAX_FOLD_ROUNDS
+            || m == 0
+            || k_bytes[8..].iter().chain(&d_bytes[8..]).chain(&m_bytes[8..]).any(|&x| x != 0)
+        {
+            return Err(ProofError::FormatError);
+        }
+        let expected_len = m
+            .checked_add(d * (4 * k - 4))
+            .and_then(|w| w.checked_add(3))
+            .and_then(|w| w.checked_mul(32))
+            .ok_or(ProofError::FormatError)?;
+        if b != expected_len {
+            return Err(ProofError::FormatError);
+        }
+
         let mut A_vecs = Vec::with_capacity(d);
         for _ in 0..d {
             let mut round = Vec::with_capacity(2 * k - 2);
@@ -1027,4 +1130,286 @@ pub fn inner_product(a: &[Scalar], b: &[Scalar]) -> Scalar {
         out += a[i] * b[i];
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn points(n: usize) -> Vec<RistrettoPoint> {
+        let mut rng = rand::thread_rng();
+        (0..n).map(|_| RistrettoPoint::random(&mut rng)).collect()
+    }
+
+    fn scalars(n: usize) -> Vec<Scalar> {
+        let mut rng = rand::thread_rng();
+        (0..n).map(|_| Scalar::random(&mut rng)).collect()
+    }
+
+    fn msm(s: &[Scalar], p: &[RistrettoPoint]) -> RistrettoPoint {
+        RistrettoPoint::vartime_multiscalar_mul(s.iter(), p.iter())
+    }
+
+    fn rounds(mut n: usize, k: usize) -> usize {
+        let mut d = 0;
+        while n > 1 {
+            n = (n + (k - n % k) % k) / k;
+            d += 1;
+        }
+        d
+    }
+
+    // A prover that writes delta into the padding slot of round `round` (The forgery the identity padding generators would allow)
+    fn forging_ipa(
+        k: usize, g_vec: &[RistrettoPoint], h_vec: &[RistrettoPoint], q: RistrettoPoint,
+        a_vec: &[Scalar], b_vec: &[Scalar], num_rounds: usize, round: usize, delta: Scalar,
+    ) -> prove_ipa {
+        let transcript = &mut Transcript::new(b"ipa-test");
+        let n = a_vec.len();
+        transcript.append_message(b"protocol-name", b"k_bullet_delay");
+        transcript.append_message(b"n", &(n as u64).to_le_bytes());
+        transcript.append_message(b"k", &(k as u64).to_le_bytes());
+        
+        let counts = fold_pad_counts(n, k, num_rounds);
+        let (mut g, mut h) = (g_vec.to_vec(), h_vec.to_vec());
+        let (mut a, mut b) = (a_vec.to_vec(), b_vec.to_vec());
+        
+        let mut gap = delta;
+        
+        let mut U_vecs = Vec::with_capacity(num_rounds);
+        
+        for j in 0..num_rounds {
+            if counts[j] > 0 {
+                let start = a.len();
+                a.extend(std::iter::repeat(Scalar::ZERO).take(counts[j]));
+                b.extend(std::iter::repeat(Scalar::ZERO).take(counts[j]));
+                let seed = pad_seed(transcript, j);
+                g.extend(fold_pad_generators(IPA_PAD_G_DOMAIN, &seed, counts[j]));
+                h.extend(fold_pad_generators(IPA_PAD_H_DOMAIN, &seed, counts[j]));
+                
+                if round == j {
+                    a[start] = gap; b[start] = Scalar::ONE; gap = Scalar::ZERO;
+                }
+            }
+            
+            let m = a.len() / k;
+            let (a_s, b_s): (Vec<&[Scalar]>, Vec<&[Scalar]>) = (a.chunks(m).collect(), b.chunks(m).collect());
+            let (g_s, h_s): (Vec<&[RistrettoPoint]>, Vec<&[RistrettoPoint]>) = (g.chunks(m).collect(), h.chunks(m).collect());
+            let (mut pos, mut neg) = (Vec::with_capacity(k - 1), Vec::with_capacity(k - 1));
+            
+            for l in 1..k {
+                let (mut u_pos, mut u_neg) = (RistrettoPoint::default(), RistrettoPoint::default());
+                for i in 0..(k - l) {
+                    u_pos += msm(a_s[i], g_s[i + l]) + msm(b_s[i + l], h_s[i]) + inner_product(a_s[i], b_s[i + l]) * q;
+                    u_neg += msm(a_s[i + l], g_s[i]) + msm(b_s[i], h_s[i + l]) + inner_product(a_s[i + l], b_s[i]) * q;
+                }
+                pos.push(u_pos); neg.push(u_neg);
+            }
+            
+            
+            
+            let mut round_points: Vec<CompressedRistretto> = pos.iter().map(|p| p.compress()).collect();
+            round_points.extend(neg.iter().map(|p| p.compress()));
+            for (idx, point) in round_points.iter().enumerate() {
+                transcript.append_message(b"U_round", &(j as u64).to_le_bytes());
+                transcript.append_message(b"U_index", &(idx as u64).to_le_bytes());
+                transcript.commit_point(b"U_point", point);
+            }
+            U_vecs.push(round_points);
+            
+            transcript.append_message(b"challenge_prefix", b"c_");
+            transcript.append_message(b"challenge_index", &(j as u64).to_le_bytes());
+            let c = transcript.challenge_scalar(b"challenge_separator");
+            let c_inv = c.invert();
+            
+            let (mut a_new, mut b_new) = (vec![Scalar::ZERO; m], vec![Scalar::ZERO; m]);
+            let (mut g_new, mut h_new) = (vec![RistrettoPoint::default(); m], vec![RistrettoPoint::default(); m]);
+            
+            for i in 0..k {
+                let c_i = scalar_pow(c, i as u64);
+                let c_rev = scalar_pow(c, (k - 1) as u64) * scalar_pow(c_inv, i as u64);
+                for t in 0..m {
+                    a_new[t] += a_s[i][t] * c_i; b_new[t] += b_s[i][t] * c_rev;
+                    g_new[t] += g_s[i][t] * c_rev; h_new[t] += h_s[i][t] * c_i;
+                }
+            }
+            a = a_new; b = b_new; g = g_new; h = h_new; gap *= scalar_pow(c, (k - 1) as u64);
+        }
+        
+        prove_ipa { k, U_vecs, a_final: a, b_final: b }
+    }
+
+    fn ipa_check(proof: &prove_ipa, n: usize, g: &[RistrettoPoint], h: &[RistrettoPoint], q: RistrettoPoint, p: RistrettoPoint) -> bool {
+        let mut transcript = Transcript::new(b"ipa-test");
+        let (s_g, s_h, s_q, s_p, s_u, s_pad, pad_points) = match proof.verification_scalars(n, &mut transcript) {
+            Ok(v) => v, Err(_) => return false,
+        };
+        let u: Option<Vec<RistrettoPoint>> = proof.U_vecs.iter().flatten().map(|u| u.decompress()).collect();
+        match u {
+            Some(u) => s_p * p + msm(&s_u, &u) == msm(&s_g, g) + msm(&s_h, h) + s_q * q + msm(&s_pad, &pad_points),
+            None => false,
+        }
+    }
+
+    fn ecp_check(proof: &prove_ecp, n: usize, g: &[RistrettoPoint], c: &[RistrettoPoint], p_g: RistrettoPoint, p_c: RistrettoPoint) -> bool {
+        let mut transcript = Transcript::new(b"ecp-test");
+        let (z_s, s_p, s_a, z_pad, g_pad) = match proof.verification_scalars(n, &mut transcript) {
+            Ok(v) => v, Err(_) => return false,
+        };
+        let a0: Option<Vec<RistrettoPoint>> = proof.A_vecs.iter().flatten().map(|a| a[0].decompress()).collect();
+        let a1: Option<Vec<RistrettoPoint>> = proof.A_vecs.iter().flatten().map(|a| a[1].decompress()).collect();
+        match (a0, a1) {
+            (Some(a0), Some(a1)) => msm(&z_s, g) + msm(&z_pad, &g_pad) == s_p * p_g + msm(&s_a, &a0) && msm(&z_s[..c.len()], c) == s_p * p_c + msm(&s_a, &a1),
+            _ => false,
+        }
+    }
+
+    const CONFIGS: [(usize, usize); 5] = [(10, 4), (21, 3), (1001, 4), (1000, 5), (33, 2)];
+
+    fn statement(n: usize, delta: Scalar) -> (Vec<RistrettoPoint>, Vec<RistrettoPoint>, RistrettoPoint, Vec<Scalar>, Vec<Scalar>, RistrettoPoint) {
+        let (g, h, q) = (points(n), points(n), points(1)[0]);
+        let (a, b) = (scalars(n), scalars(n));
+        let p = msm(&a, &g) + msm(&b, &h) + (inner_product(&a, &b) + delta) * q;
+        (g, h, q, a, b, p)
+    }
+
+    #[test]
+    fn honest_padded_proofs_verify() {
+        for &(n, k) in CONFIGS.iter() {
+            let d = rounds(n, k);
+            let (g, h, q, a, b, p) = statement(n, Scalar::ZERO);
+            let proof = prove_ipa::create(&mut Transcript::new(b"ipa-test"), k, &g, &h, q, &a, &b, d);
+            assert!(ipa_check(&proof, n, &g, &h, q, p));
+            assert!(!ipa_check(&proof, n, &g, &h, q, p + q));
+        }
+    }
+
+    #[test]
+    fn padding_slot_forgery_is_rejected() {
+        for &(n, k) in CONFIGS.iter() {
+            let d = rounds(n, k);
+            let delta = scalars(1)[0];
+            let (g, h, q, a, b, p_false) = statement(n, delta);
+            for (round, _) in fold_pad_counts(n, k, d).iter().enumerate().filter(|&(_, &c)| c > 0) {
+                let forged = forging_ipa(k, &g, &h, q, &a, &b, d, round, delta);
+                assert!(!ipa_check(&forged, n, &g, &h, q, p_false));
+            }
+        }
+    }
+
+    #[test]
+    fn honest_padded_ecp_proofs_verify() {
+        for &(n, k) in CONFIGS.iter() {
+            let d = rounds(n, k);
+            for &c_len in [n, n - 2].iter() {
+                let (g, c, a) = (points(n), points(c_len), scalars(n));
+                let (p_g, p_c) = (msm(&a, &g), msm(&a[..c_len], &c));
+                let proof = prove_ecp::create(&mut Transcript::new(b"ecp-test"), k, &g, &c, &a, d);
+                assert!(ecp_check(&proof, n, &g, &c, p_g, p_c), "n={} k={} |C|={}", n, k, c_len);
+                assert!(!ecp_check(&proof, n, &g, &c, p_g + g[0], p_c));
+                assert!(!ecp_check(&proof, n, &g, &c, p_g, p_c + c[0]));
+            }
+        }
+    }
+
+    #[test]
+    fn pad_generators_come_from_the_transcript() {
+        let t = Transcript::new(b"pad-test");
+        let mut t_other = Transcript::new(b"pad-test");
+        t_other.append_message(b"x", b"1");
+        let seed = pad_seed(&mut t.clone(), 1);
+        assert_ne!(seed, pad_seed(&mut t.clone(), 2));
+        assert_ne!(seed, pad_seed(&mut t_other, 1));
+
+        let g_pad = fold_pad_generators(IPA_PAD_G_DOMAIN, &seed, 3);
+        assert_eq!(g_pad, fold_pad_generators(IPA_PAD_G_DOMAIN, &seed, 3));
+        assert!(g_pad.iter().all(|p| *p != RistrettoPoint::default()));
+        for domain in [IPA_PAD_H_DOMAIN, ECP_PAD_G_DOMAIN].iter() {
+            let other = fold_pad_generators(domain, &seed, 3);
+            assert!(other.iter().all(|p| !g_pad.contains(p)));
+        }
+    }
+
+
+    #[test]
+    #[ignore]
+    fn padding_generator_cost() {
+        let configs = [
+            (1_000usize, 2usize), (1_000, 4), (10_000, 2), (10_000, 4),
+            (100_000, 2), (100_000, 4), (1_000_000, 2), (1_000_000, 4),
+            (1_048_577, 2), (1_048_577, 4), (1_048_577, 5), (1_000_000, 16),
+        ];
+        println!();
+        println!("{:>10} {:>3} {:>3} {:>6} {:>12} {:>12}",
+                 "n", "k", "d", "gens", "derive(ms)", "msm(ms)");
+        for &(n, k) in configs.iter() {
+            let d = rounds(n, k);
+            let counts = fold_pad_counts(n, k, d);
+            let gens = counts.iter().sum::<usize>() * 3;
+            let reps = 20;
+
+            let start = Instant::now();
+            for _ in 0..reps {
+                let mut t = Transcript::new(b"pad-cost");
+                for (r, &count) in counts.iter().enumerate() {
+                    if count == 0 {
+                        continue;
+                    }
+                    let seed = pad_seed(&mut t, r);
+                    fold_pad_generators(IPA_PAD_G_DOMAIN, &seed, count);
+                    fold_pad_generators(IPA_PAD_H_DOMAIN, &seed, count);
+                    fold_pad_generators(ECP_PAD_G_DOMAIN, &seed, count);
+                }
+            }
+            let derive = start.elapsed().as_secs_f64() * 1e3 / reps as f64;
+
+            let pts = points(gens.max(1));
+            let scs = scalars(gens.max(1));
+            let start = Instant::now();
+            for _ in 0..reps {
+                let _ = msm(&scs, &pts);
+            }
+            let extra_msm = start.elapsed().as_secs_f64() * 1e3 / reps as f64;
+
+            println!("{:>10} {:>3} {:>3} {:>6} {:>12.3} {:>12.3}",
+                     n, k, d, gens, derive, extra_msm);
+        }
+    }
+
+    fn header(k: u64, d: u64, m: u64) -> Vec<u8> {
+        let mut buf = vec![0u8; 96];
+        buf[0..8].copy_from_slice(&k.to_le_bytes());
+        buf[32..40].copy_from_slice(&d.to_le_bytes());
+        buf[64..72].copy_from_slice(&m.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn malformed_encodings_are_rejected() {
+        let headers = [
+            (0u64, 1u64, 1u64), (1, 1, 1), (65, 1, 1), (u64::max_value(), 1, 1),
+            (4, 65, 1), (2, 1 << 40, 1), (4, 1, 0), (4, 1, u64::max_value()), (4, 1, 1 << 60),
+        ];
+        for &(k, d, m) in headers.iter() {
+            let mut buf = header(k, d, m);
+            buf.extend(vec![0u8; 32 * 8]);
+            assert!(prove_ipa::from_bytes(&buf).is_err());
+            assert!(prove_ecp::from_bytes(&buf).is_err());
+        }
+
+        let (g, h, q) = (points(10), points(10), points(1)[0]);
+        let proof = prove_ipa::create(&mut Transcript::new(b"ipa-test"), 4, &g, &h, q, &scalars(10), &scalars(10), 2);
+        let bytes = proof.to_bytes();
+        
+        assert!(prove_ipa::from_bytes(&bytes).is_ok());
+        assert!(prove_ipa::from_bytes(&bytes[..bytes.len() - 32]).is_err());
+        
+        let mut longer = bytes.clone();
+        longer.extend_from_slice(&[0u8; 32]);
+        assert!(prove_ipa::from_bytes(&longer).is_err());
+
+        let mut bad_k = proof.clone();
+        bad_k.k = 0;
+        assert!(bad_k.verification_scalars(10, &mut Transcript::new(b"ipa-test")).is_err());
+    }
 }

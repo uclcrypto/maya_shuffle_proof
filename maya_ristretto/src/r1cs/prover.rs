@@ -179,12 +179,13 @@ impl<'a, 'b> Prover<'a, 'b> {
         v: &[Scalar],
         v_blinding: Scalar,
         k_original: usize,
-    ) -> (CompressedRistretto, Vec<Variable>) {
+    ) -> Result<(CompressedRistretto, Vec<Variable>), R1CSError> {
         let start_index = self.m as usize;
         let n_padded = v.len();
 
-        // Safety check
-        assert!(k_original <= n_padded);
+        if k_original > n_padded {
+            return Err(R1CSError::FormatError);
+        }
 
         // Update prover state
         self.m += n_padded as u64;
@@ -207,7 +208,7 @@ impl<'a, 'b> Prover<'a, 'b> {
             .map(|i| Variable::Committed(i))
             .collect();
 
-        (V, vars)
+        Ok((V, vars))
     }
 
     /// Consume the `Prover`, provide the `ConstraintSystem` implementation to the closure,
@@ -297,13 +298,24 @@ impl<'a, 'b> ProverCS<'a, 'b> {
         k_fold: usize,
         num_rounds: usize,
     ) -> Result<R1CSProof, R1CSError> {
-        use inner_product_proof::inner_product;
+        use inner_product_proof::{inner_product, MAX_FOLD_FACTOR, MAX_FOLD_ROUNDS};
         use rand::thread_rng;
         use std::iter;
         use util;
 
         let n = self.a_L.len();
         let k = self.v.len();
+
+        if k == 0
+            || n > k
+            || k_fold < 2
+            || k_fold > MAX_FOLD_FACTOR
+            || num_rounds > MAX_FOLD_ROUNDS
+            || C1_prime.len() != C2_prime.len()
+            || C1_prime.len() > k
+        {
+            return Err(R1CSError::FormatError);
+        }
 
         if self.bp_gens.gens_capacity < k {
             return Err(R1CSError::InvalidGeneratorsLength);

@@ -113,4 +113,9 @@ pub enum R1CSError {
     /// a variable assignment is not provided when the prover needs it.
     #[fail(display = "Variable does not have a value assignment.")]
     MissingAssignment,
+    /// Occurs when a proof, a statement or a parameter is malformed or
+    /// inconsistent with the expected parameters
+    #[fail(display = "Malformed or inconsistent proof, statement or parameters.")]
+    FormatError,
 }
+

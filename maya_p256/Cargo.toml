@@ -2,7 +2,7 @@
 name = "maya_p256"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [lib]
 name = "maya_p256"
@@ -21,17 +21,20 @@ sha3 = "0.10"
 digest = "0.10"
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
+rand_chacha = "0.3"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 bincode = "1"
-rand_chacha = "0.3"
 
 [features]
 parallel = ["ark-ec/parallel", "ark-ff/parallel", "ark-std/parallel", "dep:rayon"]
 asm = ["ark-ff/asm"]
 yoloproofs = []
-production = []
+
+[[test]]
+name = "shuffle"
+required-features = ["yoloproofs"]
 
 [[bench]]
 name = "r1cs"

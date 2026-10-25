@@ -248,9 +248,11 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         C1_prime: &[RistrettoPoint],
         C2_prime: &[RistrettoPoint],
         C: &[RistrettoPoint],
+        k_fold: usize,
+        num_rounds: usize,
     ) -> Result<(), R1CSError> {
         use curve25519_dalek::traits::IsIdentity;
-        use inner_product_proof::inner_product;
+        use inner_product_proof::{inner_product, MAX_FOLD_FACTOR, MAX_FOLD_ROUNDS};
         use rand::thread_rng;
         use std::iter;
         use util;
@@ -265,7 +267,24 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         // 1. Checks & Padding
         let n = self.num_vars;
         let padded_n = self.num_inputs;
-        let k_fold = proof.ipp_proof.k;
+        if padded_n == 0
+            || n > padded_n
+            || k_fold < 2
+            || k_fold > MAX_FOLD_FACTOR
+            || num_rounds > MAX_FOLD_ROUNDS
+            || proof.ipp_proof.k != k_fold
+            || proof.ecp_batched.k != k_fold
+            || proof.ipp_proof.U_vecs.len() != num_rounds
+            || proof.ecp_batched.A_vecs.len() != num_rounds
+            || proof.ipp_proof.U_vecs.iter().any(|round| round.len() != 2 * k_fold - 2)
+            || proof.ecp_batched.A_vecs.iter().any(|round| round.len() != 2 * k_fold - 2)
+            || C1_prime.len() != C2_prime.len()
+            || C1_prime.len() > padded_n
+            || C.len() != 2
+            || self.V.len() != 1
+        {
+            return Err(R1CSError::FormatError);
+        }
         let pad = padded_n - n;
 
         if self.bp_gens.gens_capacity < padded_n {
@@ -325,7 +344,7 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         let w_agg = self.transcript.challenge_scalar(b"w_agg");
 
         // 3. Scalar & Point Reconstruction
-        let (s_g_cir, s_h_cir, s_Q_cir, s_P_cir, s_U_cir) = proof
+        let (s_g_cir, s_h_cir, s_Q_cir, s_P_cir, s_U_cir, s_pad_cir, pad_points_cir) = proof
             .ipp_proof
             .verification_scalars(padded_n, self.transcript)
             .map_err(|_| R1CSError::VerificationError)?;
@@ -405,10 +424,14 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         let r3 = r2 * r;
         let r4 = r3 * r;
 
-        let (z_s_vec, s_P, s_A_vec) = proof
+        let (z_s_vec, s_P, s_A_vec, z_s_pad, ecp_pad_points) = proof
             .ecp_batched
             .verification_scalars(padded_n, self.transcript)
             .map_err(|_| R1CSError::VerificationError)?;
+
+        if s_pad_cir.len() != pad_points_cir.len() || z_s_pad.len() != ecp_pad_points.len() {
+            return Err(R1CSError::VerificationError);
+        }
 
         let s_V_checkS = r4 * (-s_P);
         let s_S_prime_checkS = r4 * x_prime * (-s_P);
@@ -460,6 +483,8 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
             ) 
             .chain(s_A_vec.iter().map(|s_A| -s_A * r4)) 
             .chain(s_A_vec.iter().map(|s_A| -s_A * r3))
+            .chain(s_pad_cir.into_iter())
+            .chain(z_s_pad.iter().map(|z| z * r4))
             .collect();
 
         if _do_print {
@@ -505,11 +530,16 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                     .iter()
                     .flatten()
                     .map(|A| A[1].decompress()),
-            );
+            )
+            .chain(pad_points_cir.into_iter().map(Some))
+            .chain(ecp_pad_points.into_iter().map(Some));
 
         let combined_points: Vec<RistrettoPoint> = combined_points_iter
             .collect::<Option<Vec<_>>>()
             .ok_or(R1CSError::VerificationError)?;
+        if combined_points.len() != combined_scalars.len() {
+            return Err(R1CSError::VerificationError);
+        }
 
         if _do_print {
             eprintln!(

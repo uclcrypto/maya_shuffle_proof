@@ -66,4 +66,6 @@ pub enum R1CSError {
     VerificationError,
     #[error("Variable does not have a value assignment.")]
     MissingAssignment,
+    #[error("Malformed or inconsistent proof, statement or parameters.")]
+    FormatError,
 }

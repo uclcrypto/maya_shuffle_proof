@@ -2,6 +2,8 @@
 
 use ark_ec::CurveGroup;
 use ark_ff::{Field, One, UniformRand, Zero};
+use ark_serialize::CanonicalSerialize;
+
 use merlin::Transcript;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -14,7 +16,9 @@ use rayon::prelude::*;
 use super::{ConstraintSystem, LinearCombination, R1CSProof, Variable};
 use crate::errors::R1CSError;
 use crate::generators::{BulletproofGens, PedersenGens};
-use crate::inner_product_proof::{inner_product, prove_ecp, prove_ipa};
+use crate::inner_product_proof::{
+    inner_product, prove_ecp, prove_ipa, MAX_FOLD_FACTOR, MAX_FOLD_ROUNDS,
+};
 use crate::transcript::{point_to_bytes, TranscriptProtocol};
 use crate::util;
 
@@ -119,12 +123,13 @@ impl<'a, 'b, G: CurveGroup> Prover<'a, 'b, G> {
         &mut self,
         v: &[G::ScalarField],
         v_blinding: G::ScalarField,
-        k_original: usize,
-    ) -> (Vec<u8>, Vec<Variable>) {
+         k_original: usize,
+    ) -> Result<(Vec<u8>, Vec<Variable>), R1CSError> {
         let start_index = self.m as usize;
         let n_padded = v.len();
-        assert!(k_original <= n_padded);
-
+        if k_original > n_padded {
+            return Err(R1CSError::FormatError);
+        }
         self.m += n_padded as u64;
         for &v_i in v.iter() {
             self.cs.v.push(v_i);
@@ -151,7 +156,7 @@ impl<'a, 'b, G: CurveGroup> Prover<'a, 'b, G> {
             .map(|i| Variable::Committed(i))
             .collect();
 
-        (V_bytes, vars)
+        Ok((V_bytes, vars))
     }
 
     pub fn finalize_inputs(self) -> ProverCS<'a, 'b, G> {
@@ -226,9 +231,23 @@ impl<'a, 'b, G: CurveGroup> ProverCS<'a, 'b, G> {
         r_prime: G::ScalarField,
         k_fold: usize,
         num_rounds: usize,
-    ) -> Result<R1CSProof<G>, R1CSError> {
+    ) -> Result<R1CSProof<G>, R1CSError>
+    where
+        G: crate::generators::HashToGroup,
+    {
         let n = self.a_L.len();
         let k = self.v.len();
+
+        if k == 0
+            || n > k
+            || k_fold < 2
+            || k_fold > MAX_FOLD_FACTOR
+            || num_rounds > MAX_FOLD_ROUNDS
+            || C1_prime.len() != C2_prime.len()
+            || C1_prime.len() > k
+        {
+            return Err(R1CSError::FormatError);
+        }
 
         if self.bp_gens.gens_capacity < k {
             return Err(R1CSError::InvalidGeneratorsLength);
@@ -245,7 +264,20 @@ impl<'a, 'b, G: CurveGroup> ProverCS<'a, 'b, G> {
         let _t_total = Instant::now();
 
         // 0. Transcript & RNG
-        let mut rng = ark_std::test_rng(); // For reproducibility; use OsRng for production
+        let mut rng = {
+            use rand::{RngCore, SeedableRng};
+            let mut v_blinding_bytes = Vec::new();
+            self.v_blinding
+                .serialize_compressed(&mut v_blinding_bytes)
+                .map_err(|_| R1CSError::FormatError)?;
+            let mut seed = [0u8; 32];
+            self.transcript
+                .build_rng()
+                .rekey_with_witness_bytes(b"v_blinding", &v_blinding_bytes)
+                .finalize(&mut rand::thread_rng())
+                .fill_bytes(&mut seed);
+            rand_chacha::ChaCha20Rng::from_seed(seed)
+        };
 
         // 1. Circuit Commitment 
         let _t_phase = Instant::now();
@@ -253,8 +285,8 @@ impl<'a, 'b, G: CurveGroup> ProverCS<'a, 'b, G> {
         let o_blinding = G::ScalarField::rand(&mut rng);
         let s_blinding = G::ScalarField::rand(&mut rng);
 
-        let mut s_L: Vec<G::ScalarField> = (0..n).map(|_| G::ScalarField::rand(&mut rng)).collect();
-        let mut s_R: Vec<G::ScalarField> = (0..n).map(|_| G::ScalarField::rand(&mut rng)).collect();
+        let s_L: Vec<G::ScalarField> = (0..n).map(|_| G::ScalarField::rand(&mut rng)).collect();
+        let s_R: Vec<G::ScalarField> = (0..n).map(|_| G::ScalarField::rand(&mut rng)).collect();
         let G_n: Vec<G> = gens.G(n).cloned().collect();
         let H_n: Vec<G> = gens.H(n).cloned().collect();
 
@@ -776,7 +808,7 @@ impl<'a, 'b, G: CurveGroup> ProverCS<'a, 'b, G> {
                 "  [8] eCP proof (prove_ecp::create):       {:>8.3} ms",
                 _tp.elapsed().as_secs_f64() * 1000.0
             );
-            eprintln!("  ─────────────────────────────────────────────────────");
+            eprintln!("  -----------------------------------------------------");
             eprintln!(
                 "  TOTAL prove():                              {:>8.3} ms  (n={}, k={})",
                 _t_total.elapsed().as_secs_f64() * 1000.0,

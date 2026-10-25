@@ -97,7 +97,7 @@ impl<G: CurveGroup> R1CSProof<G> {
     pub fn from_bytes(slice: &[u8]) -> Result<R1CSProof<G>, ProofError> {
         let mut pos = 0;
 
-        let mut read_bytes = |slice: &[u8], pos: &mut usize| -> Result<Vec<u8>, ProofError> {
+        let read_bytes = |slice: &[u8], pos: &mut usize| -> Result<Vec<u8>, ProofError> {
             if slice.len() < *pos + 8 {
                 return Err(ProofError::FormatError);
             }
@@ -107,7 +107,7 @@ impl<G: CurveGroup> R1CSProof<G> {
                     .map_err(|_| ProofError::FormatError)?,
             ) as usize;
             *pos += 8;
-            if slice.len() < *pos + len {
+            if slice.len() < pos.checked_add(len).ok_or(ProofError::FormatError)? {
                 return Err(ProofError::FormatError);
             }
             let data = slice[*pos..*pos + len].to_vec();
@@ -129,7 +129,7 @@ impl<G: CurveGroup> R1CSProof<G> {
         let S1_prime = read_bytes(slice, &mut pos)?;
         let S2_prime = read_bytes(slice, &mut pos)?;
 
-        let mut read_scalar = |slice: &[u8],
+        let read_scalar = |slice: &[u8],
                                pos: &mut usize|
          -> Result<G::ScalarField, ProofError> {
             let data = {
@@ -142,7 +142,7 @@ impl<G: CurveGroup> R1CSProof<G> {
                         .map_err(|_| ProofError::FormatError)?,
                 ) as usize;
                 *pos += 8;
-                if slice.len() < *pos + len {
+                if slice.len() < pos.checked_add(len).ok_or(ProofError::FormatError)? {
                     return Err(ProofError::FormatError);
                 }
                 let d = slice[*pos..*pos + len].to_vec();
@@ -177,7 +177,11 @@ impl<G: CurveGroup> R1CSProof<G> {
         ) as usize;
         pos += 8;
 
-        if slice.len() < pos + ipp_len + ecp_len {
+        let end = pos
+            .checked_add(ipp_len)
+            .and_then(|l| l.checked_add(ecp_len))
+            .ok_or(ProofError::FormatError)?;
+        if slice.len() != end {
             return Err(ProofError::FormatError);
         }
 

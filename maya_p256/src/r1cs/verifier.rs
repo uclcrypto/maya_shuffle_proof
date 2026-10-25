@@ -174,10 +174,34 @@ impl<'a, 'b, G: CurveGroup> VerifierCS<'a, 'b, G> {
         C1_prime: &[G],
         C2_prime: &[G],
         C: &[G],
-    ) -> Result<(), R1CSError> {
+        k_fold: usize,
+        num_rounds: usize,
+    ) -> Result<(), R1CSError>
+    where
+        G: crate::generators::HashToGroup,
+    {
+        use crate::inner_product_proof::{MAX_FOLD_FACTOR, MAX_FOLD_ROUNDS};
+
         let n = self.num_vars;
         let padded_n = self.num_inputs;
-        let k_fold = proof.ipp_proof.k;
+        if padded_n == 0
+            || n > padded_n
+            || k_fold < 2
+            || k_fold > MAX_FOLD_FACTOR
+            || num_rounds > MAX_FOLD_ROUNDS
+            || proof.ipp_proof.k != k_fold
+            || proof.ecp_batched.k != k_fold
+            || proof.ipp_proof.U_vecs.len() != num_rounds
+            || proof.ecp_batched.A_vecs.len() != num_rounds
+            || proof.ipp_proof.U_vecs.iter().any(|round| round.len() != 2 * k_fold - 2)
+            || proof.ecp_batched.A_vecs.iter().any(|round| round.len() != 2 * k_fold - 2)
+            || C1_prime.len() != C2_prime.len()
+            || C1_prime.len() > padded_n
+            || C.len() != 2
+            || self.V.len() != 1
+        {
+            return Err(R1CSError::FormatError);
+        }
         let pad = padded_n - n;
 
         if self.bp_gens.gens_capacity < padded_n {
@@ -273,7 +297,7 @@ impl<'a, 'b, G: CurveGroup> VerifierCS<'a, 'b, G> {
             <Transcript as TranscriptProtocol<G>>::challenge_scalar(self.transcript, b"w_agg");
 
         // 3. Scalar & Point Reconstruction
-        let (s_g_cir, s_h_cir, s_Q_cir, s_P_cir, s_U_cir) = proof
+        let (s_g_cir, s_h_cir, s_Q_cir, s_P_cir, s_U_cir, s_pad_cir, pad_points_cir) = proof
             .ipp_proof
             .verification_scalars(padded_n, self.transcript)
             .map_err(|_| R1CSError::VerificationError)?;
@@ -287,7 +311,7 @@ impl<'a, 'b, G: CurveGroup> VerifierCS<'a, 'b, G> {
             }
         }
 
-        let y_inv = y.inverse().expect("y nonzero");
+        let y_inv = y.inverse().ok_or(R1CSError::VerificationError)?;
         let y_inv_vec: Vec<G::ScalarField> = util::exp_iter(y_inv).take(padded_n).collect();
 
         let yneg_wR: Vec<G::ScalarField> = wR
@@ -328,7 +352,7 @@ impl<'a, 'b, G: CurveGroup> VerifierCS<'a, 'b, G> {
             .collect();
 
         // 4. Verification Check Setup
-        let mut rng = ark_std::test_rng();
+        let mut rng = self.transcript.build_rng().finalize(&mut rand::thread_rng());
         let r: G::ScalarField = G::ScalarField::rand(&mut rng);
 
         let xx = x * x;
@@ -360,10 +384,14 @@ impl<'a, 'b, G: CurveGroup> VerifierCS<'a, 'b, G> {
         let r3 = r2 * r;
         let r4 = r3 * r;
 
-        let (z_s_vec, s_P, s_A_vec) = proof
+        let (z_s_vec, s_P, s_A_vec, z_s_pad, ecp_pad_points) = proof
             .ecp_batched
             .verification_scalars(padded_n, self.transcript)
             .map_err(|_| R1CSError::VerificationError)?;
+
+        if s_pad_cir.len() != pad_points_cir.len() || z_s_pad.len() != ecp_pad_points.len() {
+            return Err(R1CSError::VerificationError);
+        }
 
         let s_V_checkS = r4 * (-s_P);
         let s_S_prime_checkS = r4 * x_prime * (-s_P);
@@ -498,8 +526,14 @@ impl<'a, 'b, G: CurveGroup> VerifierCS<'a, 'b, G> {
             combined_points.push(*pt);
         }
 
+        combined_scalars.extend(s_pad_cir);
+        combined_points.extend(G::normalize_batch(&pad_points_cir));
+        combined_scalars.extend(z_s_pad.iter().map(|z| *z * r4));
+        combined_points.extend(G::normalize_batch(&ecp_pad_points));
+
         // 6. Final Execution
-        let mega_check = G::msm(&combined_points, &combined_scalars).expect("MSM");
+        let mega_check = G::msm(&combined_points, &combined_scalars)
+            .map_err(|_| R1CSError::VerificationError)?;
 
         if !mega_check.is_zero() {
             return Err(R1CSError::VerificationError);

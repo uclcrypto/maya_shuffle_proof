@@ -9,7 +9,7 @@
 //! each candidate x-coordinate is derived from SHAKE256 output, and we check
 //! whether `x^3 + ax + b` is a quadratic residue in the base field.  Because x
 //! is determined by a hash, no one knows the discrete logarithm of the
-//! resulting point relative to the curve's standard generator — the DLR
+//! resulting point relative to the curve's standard generator - the DLR
 //! assumption required for soundness is preserved.
 
 #![allow(non_snake_case)]
@@ -113,6 +113,18 @@ impl<G: CurveGroup + HashToGroup> Iterator for GeneratorsChain<G> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         (usize::max_value(), None)
     }
+}
+
+/// Padding generators of one round of a `k`-ary folding argument, derived by hash-to-group
+pub(crate) fn fold_pad_generators<G: CurveGroup + HashToGroup>(
+    domain: &[u8],
+    seed: &[u8; 32],
+    count: usize,
+) -> Vec<G> {
+    let mut label = Vec::with_capacity(domain.len() + seed.len());
+    label.extend_from_slice(domain);
+    label.extend_from_slice(seed);
+    GeneratorsChain::<G>::new(&label).take(count).collect()
 }
 
 /// Bulletproof generators: vectors G and H of group elements.
