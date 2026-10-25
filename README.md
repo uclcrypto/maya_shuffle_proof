@@ -147,7 +147,6 @@ Default is 10 runs/config to keep runtime manageable. Override with NUM_RUNS=100
 | Sweet spot | Figure 3 | `BENCH_FOLDING=1 cargo bench ...` |
 | Padding strategies | Table 12 | `BENCH_PADDING=1 cargo bench ...` |
 | MAYA-P256 | Tables 8–11 | `cd maya_p256 && cargo bench ...` |
-| Verificatum baseline | Tables 1–2 | `./Verificatum_singlecore.sh` or `./Verificatum_multicore.sh` |
 | Full averaging | Tables 1–2 | `BENCH_FULL_AVG=1 cargo bench ...` |
 
 
